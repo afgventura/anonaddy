@@ -359,4 +359,25 @@ return [
     'wordlist' => $resolveList('ANONADDY_WORDLIST', __DIR__.'/lists/wordlist.php'),
     'adjectives' => $resolveList('ANONADDY_ADJECTIVES', __DIR__.'/lists/adjectives.php'),
     'nouns' => $resolveList('ANONADDY_NOUNS', __DIR__.'/lists/nouns.php'),
+    /*
+    |--------------------------------------------------------------------------
+    | GoVisa inbound mirror (fork-local)
+    |--------------------------------------------------------------------------
+    |
+    | When BOTH of these are set, every inbound message that reaches the forward
+    | path is also POSTed to GoVisa's /api/webhook/mail-inbound, which writes it to
+    | `received_emails` -- the table GET /api/extensions/otp/latest reads.
+    |
+    | Why: that route reads received_emails FIRST and only falls back to IMAP on
+    | the ops mailbox, and mailbox-imap.ts locks "INBOX" specifically. So mail that
+    | a recipient provider files as Spam is invisible to the OTP path even though
+    | it was delivered. Mirroring here removes that dependency: the OTP is found
+    | from our own database whether or not Gmail likes the message.
+    |
+    | Left unset this is a no-op, so the fork still behaves exactly like upstream.
+    |
+    */
+
+    'govisa_inbound_url' => env('GOVISA_INBOUND_URL'),
+    'govisa_inbound_token' => env('GOVISA_INBOUND_TOKEN'),
 ];

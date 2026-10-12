@@ -19,6 +19,7 @@ use App\Services\UserRuleChecker;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Redis;
 use Illuminate\Support\Facades\Storage;
@@ -426,6 +427,10 @@ class ReceiveEmail extends Command
 
         $emailData = new EmailData($this->parser, $this->option('sender'), $this->size);
 
+        // Record it with GoVisa BEFORE any rule can block/quarantine/exit,
+        // so a blocked message is still visible in our own data.
+        $this->mirrorInboundToGovisa($emailData);
+
         // Check user rules and get rule IDs that have satisfied conditions
         $ruleIdsAndActions = UserRuleChecker::getRuleIdsAndActionsForForwards($this->user, $emailData, $this->alias, $isNewAlias ?? false);
         $ruleIds = null;
@@ -480,6 +485,48 @@ class ReceiveEmail extends Command
 
             Mail::to($aliasRecipient->email)->queue($message);
         });
+    }
+
+    /**
+     * Fork-local: POST this inbound message to GoVisa so it lands in
+     * `received_emails` (the OTP route's primary source) regardless of what the
+     * recipient's mailbox provider does with the forwarded copy.
+     *
+     * CONTRACT: this must NEVER affect mail delivery. Any failure is swallowed and
+     * logged in one non-PII line, and the whole thing is a no-op unless both
+     * config values are present.
+     */
+    protected function mirrorInboundToGovisa(EmailData $emailData): void
+    {
+        $url = config('anonaddy.govisa_inbound_url');
+        $token = config('anonaddy.govisa_inbound_token');
+
+        if (empty($url) || empty($token)) {
+            return;
+        }
+
+        try {
+            $alias = $this->inboundAlias['email'] ?? null;
+
+            Http::withToken($token)
+                ->timeout(5)
+                ->acceptJson()
+                ->post($url, [
+                    // Recipients carry the ALIAS (what the OTP route scopes by);
+                    // the forward target is not useful to the receiver.
+                    'to' => array_values(array_filter([$alias])),
+                    'from' => $emailData->sender,
+                    'subject' => $emailData->subject,
+                    // EmailData stores bodies base64-encoded.
+                    'text' => $emailData->text ? base64_decode($emailData->text) : null,
+                    'html' => $emailData->html ? base64_decode($emailData->html) : null,
+                    'date' => $this->parser->getHeader('date') ?: now()->toIso8601String(),
+                    'message_id' => $this->parser->getHeader('message-id') ?: null,
+                ]);
+        } catch (\Throwable $e) {
+            // Event only: no body, no sender, no alias.
+            Log::warning('GoVisa inbound mirror failed: '.$e->getMessage());
+        }
     }
 
     protected function handleQuarantine($emailType)
