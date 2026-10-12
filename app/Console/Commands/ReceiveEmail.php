@@ -516,7 +516,10 @@ class ReceiveEmail extends Command
                     // the forward target is not useful to the receiver.
                     'to' => array_values(array_filter([$alias])),
                     'from' => $emailData->sender,
-                    'subject' => $emailData->subject,
+                    // EmailData base64-encodes this too (EmailData.php:135), same as
+                    // the bodies -- it is NOT the plain header. Passing it through raw
+                    // stored "W2N1dG92ZXIt..." instead of the real subject.
+                    'subject' => $emailData->subject ? base64_decode($emailData->subject) : null,
                     // EmailData stores bodies base64-encoded.
                     'text' => $emailData->text ? base64_decode($emailData->text) : null,
                     'html' => $emailData->html ? base64_decode($emailData->html) : null,
