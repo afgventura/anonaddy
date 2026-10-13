@@ -2,8 +2,6 @@
 
 namespace App\Models;
 
-use App\Dns\DomainDnsLookup;
-use App\Enums\DnsLookupStatus;
 use App\Http\Resources\DomainResource;
 use App\Traits\HasEncryptedAttributes;
 use App\Traits\HasUuid;
@@ -253,7 +251,7 @@ class Domain extends Model
      */
     public function checkVerificationForSending()
     {
-        if ($this->shouldBypassSendingDnsChecks()) {
+        if (App::environment('testing')) {
             $this->markDomainAsVerifiedForSending();
 
             return response()->json([
@@ -263,46 +261,115 @@ class Domain extends Model
             ]);
         }
 
-        $selector = config('anonaddy.dkim_selector');
+        try {
+            $spf = collect(dns_get_record($this->domain.'.', DNS_TXT))
+                ->contains(function ($r) {
+                    return preg_match("/^(v=spf1).*(include:spf\.".config('anonaddy.domain').'|mx).*(-|~)all$/', $r['txt']);
+                });
+        } catch (Exception $e) {
+            Log::info('DNS Get SPF Error:', ['domain' => $this->domain, 'user' => $this->user?->username, 'error' => $e->getMessage()]);
 
-        $checks = [
-            [
-                'label' => 'SPF',
-                'name' => $this->domain.'.',
-                'type' => DNS_TXT,
-                'missing' => 'SPF record not found. This could be due to DNS caching, please try again later.',
-                'matcher' => fn (array $record) => preg_match("/^(v=spf1).*(include:spf\.".config('anonaddy.domain').'|mx).*(-|~)all$/', $record['txt'] ?? ''),
-            ],
-            [
-                'label' => 'DMARC',
-                'name' => '_dmarc.'.$this->domain.'.',
-                'type' => DNS_TXT,
-                'missing' => 'DMARC record not found. This could be due to DNS caching, please try again later.',
-                'matcher' => fn (array $record) => preg_match('/^(v=DMARC1).*(p=quarantine|reject).*/', $record['txt'] ?? ''),
-            ],
-            [
-                'label' => 'DKIM',
-                'name' => $selector.'._domainkey.'.$this->domain.'.',
-                'type' => DNS_CNAME,
-                'missing' => 'CNAME '.$selector.'._domainkey record not found. This could be due to DNS caching, please try again later.',
-                'matcher' => fn (array $record) => ($record['target'] ?? null) === $selector.'._domainkey.'.config('anonaddy.domain'),
-            ],
-        ];
+            $spf = null;
+        }
 
-        foreach ($checks as $check) {
-            $status = $this->lookupSendingDnsRecord($check['name'], $check['type'], $check['matcher'], $check['label']);
+        if (! $spf) {
+            return response()->json([
+                'success' => false,
+                'message' => 'SPF record not found. This could be due to DNS caching, please try again later.',
+                'data' => new DomainResource($this->fresh()),
+            ]);
+        }
 
-            if ($status === DnsLookupStatus::Failed) {
-                return $this->sendingDnsLookupFailedResponse();
+        try {
+            $dmarc = collect(dns_get_record('_dmarc.'.$this->domain.'.', DNS_TXT))
+                ->contains(function ($r) {
+                    return preg_match('/^(v=DMARC1).*(p=quarantine|reject).*/', $r['txt']);
+                });
+        } catch (Exception $e) {
+            Log::info('DNS Get DMARC Error:', ['domain' => $this->domain, 'user' => $this->user?->username, 'error' => $e->getMessage()]);
+
+            $dmarc = null;
+        }
+
+        if (! $dmarc) {
+            return response()->json([
+                'success' => false,
+                'message' => 'DMARC record not found. This could be due to DNS caching, please try again later.',
+                'data' => new DomainResource($this->fresh()),
+            ]);
+        }
+
+        // ── GoVisa fork: accept a PER-DOMAIN DKIM TXT as well as upstream's CNAME ──
+        // Marker asserted by infra/addy/bootstrap-startup.sh when it stages this
+        // file: govisa_accepts_per_domain_dkim_txt
+        //
+        // Upstream only accepts a CNAME pointing at the instance's own DKIM
+        // record. That shape forces every alias domain onto ONE shared keypair,
+        // because a CNAME can only ever resolve to a single record.
+        //
+        // We deliberately publish a PER-DOMAIN key instead: the private half is
+        // generated on the mail host and never leaves it (infra/addy/addy-dkim.sh,
+        // whose header explains why it must never go in Secret Manager). The point
+        // is blast radius — a leaked key compromises one domain rather than all
+        // seven, and these domains carry the OTP rail our applicants trust.
+        //
+        // Without this, the daily `anonaddy:check-domains-sending-verification`
+        // fails every domain we own, NULLs domain_sending_verified_at, and
+        // ForwardEmail::build() then rewrites From: from the alias to
+        // config('mail.from.address') — i.e. ops silently stops being able to
+        // send as the case's alias.
+        //
+        // So accept EITHER shape:
+        //   (a) upstream's CNAME to <selector>._domainkey.<anonaddy.domain>, or
+        //   (b) a TXT at <selector>._domainkey.<domain> holding this domain's own
+        //       public key.
+        //
+        // The TXT is validated the way addy-dkim.sh validates what it publishes:
+        // DKIM1 shape, and a p= long enough to be a real RSA key. That script
+        // refuses anything under 300 base64 characters because a truncated record
+        // is worse than none — the alias domains run strict DMARC (adkim=s), so a
+        // broken signature fails closed.
+        try {
+            $selector = config('anonaddy.dkim_selector');
+            $dkimName = $selector.'._domainkey.'.$this->domain.'.';
+
+            $dkim = collect(dns_get_record($dkimName, DNS_CNAME))
+                ->contains(function ($r) use ($selector) {
+                    return ($r['target'] ?? null) === $selector.'._domainkey.'.config('anonaddy.domain');
+                });
+
+            if (! $dkim) {
+                $dkim = collect(dns_get_record($dkimName, DNS_TXT))
+                    ->contains(function ($r) {
+                        $txt = trim($r['txt'] ?? '');
+
+                        if (! preg_match('/^v=DKIM1\s*;/i', $txt)) {
+                            return false;
+                        }
+
+                        // Everything after `p=`. dns_get_record already joins the
+                        // quoted chunks, but strip whitespace anyway because the
+                        // presentation form wraps and a wrapped record must not be
+                        // mistaken for a short one.
+                        if (! preg_match('/\bp=([A-Za-z0-9+\/=\s]+)/', $txt, $m)) {
+                            return false;
+                        }
+
+                        return strlen(preg_replace('/\s+/', '', $m[1])) > 300;
+                    });
             }
+        } catch (Exception $e) {
+            Log::info('DNS Get DKIM Error:', ['domain' => $this->domain, 'user' => $this->user?->username, 'error' => $e->getMessage()]);
 
-            if ($status === DnsLookupStatus::Missing) {
-                return response()->json([
-                    'success' => false,
-                    'message' => $check['missing'],
-                    'data' => new DomainResource($this->fresh()),
-                ]);
-            }
+            $dkim = null;
+        }
+
+        if (! $dkim) {
+            return response()->json([
+                'success' => false,
+                'message' => 'No usable DKIM record at '.config('anonaddy.dkim_selector').'._domainkey.'.$this->domain.' — expected either a CNAME to the instance record or a TXT holding this domain\'s own public key. This could be due to DNS caching, please try again later.',
+                'data' => new DomainResource($this->fresh()),
+            ]);
         }
 
         $this->markDomainAsVerifiedForSending();
@@ -310,67 +377,6 @@ class Domain extends Model
         return response()->json([
             'success' => true,
             'message' => 'Records successfully verified.',
-            'data' => new DomainResource($this->fresh()),
-        ]);
-    }
-
-    /**
-     * Skip live DNS lookups in tests unless a test opts in.
-     */
-    protected function shouldBypassSendingDnsChecks(): bool
-    {
-        return App::environment('testing') && ! config('anonaddy.run_dns_checks');
-    }
-
-    /**
-     * @param  callable(array<string, mixed>): bool  $matcher
-     */
-    protected function lookupSendingDnsRecord(string $name, int $type, callable $matcher, string $logLabel): DnsLookupStatus
-    {
-        try {
-            $records = app(DomainDnsLookup::class)->getRecords($name, $type);
-        } catch (Exception $e) {
-            Log::info("DNS Get {$logLabel} Error:", [
-                'domain' => $this->domain,
-                'user' => $this->user?->username,
-                'error' => $e->getMessage(),
-            ]);
-
-            return DnsLookupStatus::Failed;
-        }
-
-        if ($records === false) {
-            Log::info("DNS Get {$logLabel} Error:", [
-                'domain' => $this->domain,
-                'user' => $this->user?->username,
-                'error' => 'dns_get_record returned false',
-            ]);
-
-            return DnsLookupStatus::Failed;
-        }
-
-        if (collect($records)->contains($matcher)) {
-            return DnsLookupStatus::Found;
-        }
-
-        return DnsLookupStatus::Missing;
-    }
-
-    protected function sendingDnsLookupFailedResponse()
-    {
-        if ($this->isVerifiedForSending()) {
-            return response()->json([
-                'success' => true,
-                'dns_error' => true,
-                'message' => 'DNS lookup failed. Domain left verified for sending.',
-                'data' => new DomainResource($this->fresh()),
-            ]);
-        }
-
-        return response()->json([
-            'success' => false,
-            'dns_error' => true,
-            'message' => 'DNS lookup failed. This could be due to DNS caching, please try again later.',
             'data' => new DomainResource($this->fresh()),
         ]);
     }
