@@ -492,9 +492,9 @@ class ReceiveEmail extends Command
      * `received_emails` (the OTP route's primary source) regardless of what the
      * recipient's mailbox provider does with the forwarded copy.
      *
-     * CONTRACT: this must NEVER affect mail delivery. Any failure is swallowed and
-     * logged in one non-PII line, and the whole thing is a no-op unless both
-     * config values are present.
+     * CONTRACT: persist before accepting the inbound message. API outages do not
+     * delay Gmail forwarding; persistent-disk failure returns EX_TEMPFAIL so
+     * Postfix retains and retries the original. Disabled config remains a no-op.
      */
     protected function mirrorInboundToGovisa(EmailData $emailData): void
     {
