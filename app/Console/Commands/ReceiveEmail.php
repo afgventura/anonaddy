@@ -508,10 +508,7 @@ class ReceiveEmail extends Command
         try {
             $alias = $this->inboundAlias['email'] ?? null;
 
-            Http::withToken($token)
-                ->timeout(5)
-                ->acceptJson()
-                ->post($url, [
+            $payload = [
                     // Recipients carry the ALIAS (what the OTP route scopes by);
                     // the forward target is not useful to the receiver.
                     'to' => array_values(array_filter([$alias])),
@@ -523,12 +520,17 @@ class ReceiveEmail extends Command
                     // EmailData stores bodies base64-encoded.
                     'text' => $emailData->text ? base64_decode($emailData->text) : null,
                     'html' => $emailData->html ? base64_decode($emailData->html) : null,
-                    'date' => $this->parser->getHeader('date') ?: now()->toIso8601String(),
+                    'date' => $this->parser->getHeader('date') ?: null,
                     'message_id' => $this->parser->getHeader('message-id') ?: null,
-                ]);
+                ];
+            // The worker handles network delivery independently of Gmail.
+            require_once '/data/govisa-mirror-tools/DurableMirror.php';
+            \DurableMirror::enqueue('/data/govisa-mirror', $payload);
         } catch (\Throwable $e) {
             // Event only: no body, no sender, no alias.
-            Log::warning('GoVisa inbound mirror failed: '.$e->getMessage());
+            Log::error('GoVisa inbound mirror spool unavailable');
+            // EX_TEMPFAIL: Postfix retains the original on persistent-disk failure.
+            exit(75);
         }
     }
 
